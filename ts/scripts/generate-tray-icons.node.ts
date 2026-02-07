@@ -12,6 +12,8 @@ const imagesDir = join(cwd, '..', '..', 'images');
 const trayIconsDir = join(imagesDir, 'tray-icons');
 const trayIconsBaseDir = join(trayIconsDir, 'base');
 const trayIconsAlertsDir = join(trayIconsDir, 'alert');
+const trayIconsMonoBaseDir = join(trayIconsDir, 'mono-base');
+const trayIconsMonoAlertsDir = join(trayIconsDir, 'mono-alert');
 
 enum TrayIconSize {
   Size16 = '16',
@@ -130,10 +132,30 @@ function trayIconValueToText(
   throw new TypeError(`Invalid value ${value}`);
 }
 
+const MonoVariants: Record<TrayIconSize, TrayIconVariant> = {
+  [TrayIconSize.Size16]: {
+    ...Variants[TrayIconSize.Size16],
+    image: join(trayIconsMonoBaseDir, 'signal-tray-icon-16x16-mono-base.png'),
+  },
+  [TrayIconSize.Size32]: {
+    ...Variants[TrayIconSize.Size32],
+    image: join(trayIconsMonoBaseDir, 'signal-tray-icon-32x32-mono-base.png'),
+  },
+  [TrayIconSize.Size48]: {
+    ...Variants[TrayIconSize.Size48],
+    image: join(trayIconsMonoBaseDir, 'signal-tray-icon-48x48-mono-base.png'),
+  },
+  [TrayIconSize.Size256]: {
+    ...Variants[TrayIconSize.Size256],
+    image: join(trayIconsMonoBaseDir, 'signal-tray-icon-256x256-mono-base.png'),
+  },
+};
+
 async function generateTrayIconImage(
-  request: TrayIconImageRequest
+  request: TrayIconImageRequest,
+  variants: Record<TrayIconSize, TrayIconVariant> = Variants
 ): Promise<Buffer> {
-  const variant = Variants[request.size];
+  const variant = variants[request.size];
   if (variant == null) {
     throw new TypeError(`Invalid variant size (${request.size})`);
   }
@@ -230,18 +252,18 @@ function range(start: number, end: number): Array<number> {
   return Array.from({ length }, (_, index) => start + index);
 }
 
-async function main() {
-  try {
-    await rm(trayIconsAlertsDir, { recursive: true });
-  } catch (error) {
-    if (error.code !== 'ENOENT') {
-      throw error;
-    }
-  }
+async function rmSafe(dir: string) {
+  await rm(dir, { recursive: true, force: true });
+}
 
+async function generateAlertIcons(
+  variants: Record<TrayIconSize, TrayIconVariant>,
+  outputDir: string,
+  prefix: string
+) {
   const requests: Array<TrayIconImageRequest> = [];
   for (const size of Object.values(TrayIconSize)) {
-    const variant = Variants[size];
+    const variant = variants[size];
     const { maxCount } = variant;
     const values = range(1, maxCount + 1);
     for (const value of values) {
@@ -249,22 +271,33 @@ async function main() {
     }
   }
 
+  await mkdir(outputDir, { recursive: true });
+
   await Promise.all(
     requests.map(async ({ size, value }) => {
-      const variant = Variants[size];
+      const variant = variants[size];
       const text = trayIconValueToText(value, variant);
 
-      const fileDir = join(trayIconsAlertsDir);
-      const fileName = `signal-tray-icon-${size}x${size}-alert-${text}.png`;
-      const filePath = join(fileDir, fileName);
+      const fileName = `signal-tray-icon-${size}x${size}-${prefix}-${text}.png`;
+      const filePath = join(outputDir, fileName);
 
-      const fileContents = await generateTrayIconImage({ size, value });
+      const fileContents = await generateTrayIconImage(
+        { size, value },
+        variants
+      );
 
       console.log(`Writing "${fileName}"`);
-      await mkdir(fileDir, { recursive: true });
       await writeFile(filePath, fileContents);
     })
   );
+}
+
+async function main() {
+  await rmSafe(trayIconsAlertsDir);
+  await rmSafe(trayIconsMonoAlertsDir);
+
+  await generateAlertIcons(Variants, trayIconsAlertsDir, 'alert');
+  await generateAlertIcons(MonoVariants, trayIconsMonoAlertsDir, 'mono-alert');
 
   console.log('Done');
 }

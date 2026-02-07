@@ -30,6 +30,7 @@ export class SystemTrayService {
   readonly #i18n: LocalizerType;
   #tray?: Tray;
   #isEnabled = false;
+  #isMonochrome = false;
   #isQuitting = false;
   #unreadCount = 0;
   #createTrayInstance: (icon: NativeImage) => Tray;
@@ -39,7 +40,13 @@ export class SystemTrayService {
     this.#i18n = i18n;
     this.#createTrayInstance = createTrayInstance || (icon => new Tray(icon));
 
-    nativeTheme.on('updated', this.#render);
+    nativeTheme.on('updated', () => {
+      if (!this.#isMonochrome) {
+        return;
+      }
+      clearIconCache();
+      this.#render();
+    });
   }
 
   /**
@@ -103,6 +110,22 @@ export class SystemTrayService {
   }
 
   /**
+   * Enable or disable monochrome tray icon mode.
+   */
+  setMonochromeIcon(isMonochrome: boolean): void {
+    if (this.#isMonochrome === isMonochrome) {
+      return;
+    }
+
+    log.info(
+      `System tray service: ${isMonochrome ? 'enabling' : 'disabling'} monochrome icon`
+    );
+    this.#isMonochrome = isMonochrome;
+    clearIconCache();
+    this.#render();
+  }
+
+  /**
    * Workaround for: https://github.com/electron/electron/issues/32581#issuecomment-1020359931
    *
    * Tray is automatically destroyed when app quits so we shouldn't destroy it
@@ -140,12 +163,12 @@ export class SystemTrayService {
     const browserWindow = this.#browserWindow;
 
     try {
-      tray.setImage(getIcon(this.#unreadCount));
+      tray.setImage(getIcon(this.#unreadCount, this.#isMonochrome));
     } catch (err: unknown) {
       log.warn(
         'System tray service: failed to set preferred image. Falling back...'
       );
-      tray.setImage(getDefaultIcon());
+      tray.setImage(getDefaultIcon(this.#isMonochrome));
     }
 
     // NOTE: we want to have the show/hide entry available in the tray icon
@@ -210,7 +233,7 @@ export class SystemTrayService {
     log.info('System tray service: creating the tray');
 
     // This icon may be swiftly overwritten.
-    const result = this.#createTrayInstance(getDefaultIcon());
+    const result = this.#createTrayInstance(getDefaultIcon(this.#isMonochrome));
 
     // Note: "When app indicator is used on Linux, the click event is ignored." This
     //   doesn't mean that the click event is always ignored on Linux; it depends on how
@@ -269,20 +292,27 @@ function getVariantForScaleFactor(scaleFactor: number) {
   return match ?? Variant.Size32;
 }
 
-function getTrayIconImagePath(size: number, unreadCount: number): string {
+function getTrayIconImagePath(
+  size: number,
+  unreadCount: number,
+  monochrome: boolean
+): string {
+  const prefix = monochrome ? 'mono-' : '';
   let dirName: string;
-  let fileName: string;
+  let suffix: string;
 
   if (unreadCount === 0) {
-    dirName = 'base';
-    fileName = `signal-tray-icon-${size}x${size}-base.png`;
+    dirName = `${prefix}base`;
+    suffix = `${prefix}base`;
   } else if (unreadCount < 10) {
-    dirName = 'alert';
-    fileName = `signal-tray-icon-${size}x${size}-alert-${unreadCount}.png`;
+    dirName = `${prefix}alert`;
+    suffix = `${prefix}alert-${unreadCount}`;
   } else {
-    dirName = 'alert';
-    fileName = `signal-tray-icon-${size}x${size}-alert-9+.png`;
+    dirName = `${prefix}alert`;
+    suffix = `${prefix}alert-9+`;
   }
+
+  const fileName = `signal-tray-icon-${size}x${size}-${suffix}.png`;
 
   const iconPath = join(
     __dirname,
@@ -298,8 +328,92 @@ function getTrayIconImagePath(size: number, unreadCount: number): string {
 
 const TrayIconCache = new Map<string, NativeImage>();
 
-function getIcon(unreadCount: number) {
-  const cacheKey = `${Math.min(unreadCount, 10)}`;
+function clearIconCache(): void {
+  TrayIconCache.clear();
+  defaultIcon = undefined;
+}
+
+/**
+ * For monochrome icons on light themes, invert white pixels to black
+ * so the icon is visible on light panels. Badge text (white on red)
+ * is preserved by detecting the badge region and skipping it.
+ */
+function invertMonochromeIcon(buffer: Buffer): Buffer {
+  const img = nativeImage.createFromBuffer(buffer);
+  const bitmap = img.toBitmap();
+  const { width, height } = img.getSize();
+  const stride = width * 4;
+
+  // Build a set of pixel indices that belong to the badge region.
+  // Badge pixels are red-ish (high R, low G, low B).
+  const badgeRegion = new Set<number>();
+  for (let i = 0; i < bitmap.length; i += 4) {
+    if (bitmap[i] > 150 && bitmap[i + 1] < 100 && bitmap[i + 2] < 100) {
+      badgeRegion.add(i);
+    }
+  }
+
+  // Iteratively expand badge region to cover text drawn on it.
+  // At 256px the font is large enough that text pixels can be
+  // many pixels away from the nearest red badge pixel.
+  const iterations = Math.ceil(Math.max(width, height) / 32);
+  const badgeExpanded = new Set(badgeRegion);
+  let frontier = new Set(badgeRegion);
+  for (let n = 0; n < iterations; n += 1) {
+    const next = new Set<number>();
+    for (const i of frontier) {
+      const col = (i / 4) % width;
+      const offsets = [-stride, stride];
+      if (col > 0) {
+        offsets.push(-4);
+      }
+      if (col < width - 1) {
+        offsets.push(4);
+      }
+      for (const offset of offsets) {
+        const neighbor = i + offset;
+        if (
+          neighbor >= 0 &&
+          neighbor < bitmap.length &&
+          !badgeExpanded.has(neighbor)
+        ) {
+          badgeExpanded.add(neighbor);
+          next.add(neighbor);
+        }
+      }
+    }
+    if (next.size === 0) {
+      break;
+    }
+    frontier = next;
+  }
+
+  // Invert white pixels to black, skipping the badge region.
+  for (let i = 0; i < bitmap.length; i += 4) {
+    if (badgeExpanded.has(i)) {
+      continue;
+    }
+    const r = bitmap[i];
+    const g = bitmap[i + 1];
+    const b = bitmap[i + 2];
+    if (r > 200 && g > 200 && b > 200) {
+      bitmap[i] = 0;
+      bitmap[i + 1] = 0;
+      bitmap[i + 2] = 0;
+    }
+  }
+
+  return nativeImage.createFromBitmap(bitmap, { width, height }).toPNG();
+}
+
+function getMonoCachePrefix(isDark: boolean): string {
+  return isDark ? 'mono-dark-' : 'mono-light-';
+}
+
+function getIcon(unreadCount: number, monochrome = false) {
+  const isDark = nativeTheme.shouldUseDarkColors;
+  const prefix = monochrome ? getMonoCachePrefix(isDark) : '';
+  const cacheKey = `${prefix}${Math.min(unreadCount, 10)}`;
 
   const cached = TrayIconCache.get(cacheKey);
   if (cached != null) {
@@ -310,14 +424,23 @@ function getIcon(unreadCount: number) {
 
   let image: NativeImage;
 
+  const shouldInvert = monochrome && !isDark;
+
   if (platform === 'linux') {
     // Linux: Static tray icons
     // Use a single tray icon for Linux, as it does not support scale factors.
     // We choose the best icon based on the highest display scale factor.
     const scaleFactor = getDisplaysMaxScaleFactor();
     const variant = getVariantForScaleFactor(scaleFactor);
-    const iconPath = getTrayIconImagePath(variant.size, unreadCount);
-    const buffer = readFileSync(iconPath);
+    const iconPath = getTrayIconImagePath(
+      variant.size,
+      unreadCount,
+      monochrome
+    );
+    let buffer = readFileSync(iconPath);
+    if (shouldInvert) {
+      buffer = invertMonochromeIcon(buffer);
+    }
     image = nativeImage.createFromBuffer(buffer, {
       scaleFactor: 1.0, // Must be 1.0 for Linux
       width: variant.size,
@@ -328,8 +451,15 @@ function getIcon(unreadCount: number) {
     image = nativeImage.createEmpty();
 
     for (const variant of Variants) {
-      const iconPath = getTrayIconImagePath(variant.size, unreadCount);
-      const buffer = readFileSync(iconPath);
+      const iconPath = getTrayIconImagePath(
+        variant.size,
+        unreadCount,
+        monochrome
+      );
+      let buffer = readFileSync(iconPath);
+      if (shouldInvert) {
+        buffer = invertMonochromeIcon(buffer);
+      }
       image.addRepresentation({
         buffer,
         width: variant.size,
@@ -345,8 +475,12 @@ function getIcon(unreadCount: number) {
 }
 
 let defaultIcon: undefined | NativeImage;
-function getDefaultIcon(): NativeImage {
-  defaultIcon ??= getIcon(0);
+function getDefaultIcon(monochrome = false): NativeImage {
+  if (monochrome) {
+    // Don't cache monochrome default separately in the module-level var
+    return getIcon(0, true);
+  }
+  defaultIcon ??= getIcon(0, false);
   return defaultIcon;
 }
 
